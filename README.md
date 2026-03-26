@@ -313,7 +313,8 @@ SSL pinning bypass is a critical skill for mobile security professionals. While 
 - [iOS Security Guide - Apple](https://www.apple.com/business/docs/iOS_Security_Guide.pdf)
 - [HackingTeam SSL Pinning Bypass Research](https://www.hackingteam.it/)
 - [Security Research - Certificate Pinning](https://www.certificate-pinning.io/)
- - -
+ - -
+
 **Disclaimer**: This article is for educational purposes only. 
 **Author**: Rahul Dhiman | Cybersecurity Professional 
 **Last Updated**: March 25, 2026
