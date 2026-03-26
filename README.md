@@ -311,7 +311,6 @@ SSL pinning bypass is a critical skill for mobile security professionals. While 
 - [OWASP Mobile Security Testing Guide (MSTG)](https://owasp.org/www-project-mobile-security-testing-guide/)
 - [Frida Documentation](https://frida.re/)
 - [iOS Security Guide - Apple](https://www.apple.com/business/docs/iOS_Security_Guide.pdf)
-- [HackingTeam SSL Pinning Bypass Research](https://www.hackingteam.it/)
 - [Security Research - Certificate Pinning](https://www.certificate-pinning.io/)
 
 
