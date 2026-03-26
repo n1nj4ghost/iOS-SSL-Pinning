@@ -317,5 +317,3 @@ SSL pinning bypass is a critical skill for mobile security professionals. While 
 
 
 **Disclaimer**: This article is for educational purposes only. 
-**Author**: Rahul Dhiman | Cybersecurity Professional 
-**Last Updated**: March 25, 2026
