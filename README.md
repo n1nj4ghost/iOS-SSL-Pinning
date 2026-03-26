@@ -164,7 +164,6 @@ ios sslpinning disable
 # Verify the bypass
 ios http get https://example.com
 ```
- - -
 ## Method 5: Charles Proxy with Certificate Replacement
 Charles Proxy provides a GUI-based approach for iOS security testing.
 ### Steps:
