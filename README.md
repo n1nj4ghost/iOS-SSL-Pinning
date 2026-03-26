@@ -314,7 +314,7 @@ SSL pinning bypass is a critical skill for mobile security professionals. While 
 - [HackingTeam SSL Pinning Bypass Research](https://www.hackingteam.it/)
 - [Security Research - Certificate Pinning](https://www.certificate-pinning.io/)
 
- - -
+
 
 **Disclaimer**: This article is for educational purposes only. 
 **Author**: Rahul Dhiman | Cybersecurity Professional 
