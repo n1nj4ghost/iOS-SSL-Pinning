@@ -1,0 +1,469 @@
+# Operational iOS SSL Pinning Bypass — Working Playbook
+
+## Context
+
+You're testing iOS apps in authorized scope (bug bounty / pentest / CTF / research on
+apps you control). SSL pinning blocks your intercept proxy (Burp / mitmproxy / Caido)
+from seeing TLS traffic, even after installing your CA. This playbook is the
+operational sequence I run: cheapest tooling first, surgical Frida hooks next,
+binary patching as the last resort. It is built around real-world failure modes
+(NSURLSession + custom `URLSessionDelegate`, AFNetworking/Alamofire pin sets,
+TrustKit, custom C/Swift pinning, Flutter/Xamarin/RN stacks, CFNetwork).
+
+Assume jailbroken device for production runs; non-jailbroken path is documented for
+when only an IPA is available.
+
+---
+
+## Phase 0 — Prerequisites
+
+### Device
+
+- **Preferred:** iPhone with `palera1n` (A11 and below, iOS 15–17) or `Dopamine`
+  (A12+, iOS 15–16.6.1), or `checkra1n` for legacy hardware.
+- SSH over USB via `iproxy 2222 22` (libimobiledevice). Default creds: `root` / `alpine`
+  (rotate immediately after first boot).
+- Cydia / Sileo / Zebra installed.
+
+### On-device packages (via Sileo/Zebra/apt)
+
+- `frida-server` (from build.frida.re repo) — match version to your host Frida.
+- `Filza` or `NewTerm 3` — file browsing + on-device shell.
+- `SSL Kill Switch 3` (Julio Verne / evilpenguin) — drop-in for iOS 14–17. (SSL
+  Kill Switch 2 is dead past iOS 13.)
+- `Liberty Lite (Beta)` or `Choicy` — to prevent jailbreak detection from killing
+  the app before pinning even matters.
+- `appinst` / `TrollStore` for sideloading patched IPAs without re-signing.
+
+### Host (Windows in your case, but most tooling is cross-platform)
+
+- Python 3.11+ venv.
+- `pip install frida-tools objection`. Match `frida` and `frida-server` versions
+  exactly — version mismatch silently breaks `Interceptor`.
+- `Burp Suite` or `mitmproxy` (`pip install mitmproxy`). Configure proxy listener
+  on `0.0.0.0:8080`.
+- Install Burp/mitmproxy CA on device: Settings → General → VPN & Device
+  Management → trust profile → Settings → General → About → Certificate Trust
+  Settings → enable for the CA. Without the second step root CA is installed but
+  *not trusted for TLS* — common silent failure.
+- `class-dump`, `otool`, `lldb`, `Hopper`/`IDA`/`Ghidra` for static work.
+- `frida-ios-dump` (AloneMonkey) to pull decrypted `.ipa` from a jailbroken device.
+
+### Connectivity sanity check
+
+Before touching pinning, prove the proxy + CA chain works on a *non-pinned* app
+(Safari hitting https://example.com should show no warning, request should appear
+in proxy). If Safari fails, your CA install is wrong — fix that before blaming
+pinning.
+
+---
+
+## Phase 1 — Recon: identify the pinning implementation
+
+Pin bypass is library-specific. Don't fire generic hooks blindly — fingerprint first.
+
+### 1.1 Pull the binary
+
+Jailbroken:
+```
+frida-ios-dump -l                       # list installed apps
+frida-ios-dump <bundle.id>              # produces Decrypted.ipa
+unzip Decrypted.ipa -d app/
+```
+
+The Mach-O is at `app/Payload/<App>.app/<App>`.
+
+### 1.2 Static fingerprint
+
+```
+# Strings: look for known pinning identifiers
+strings -a Payload/App.app/App | grep -Ei \
+  'pin|TrustKit|AFNetworking|AFSecurityPolicy|Alamofire|ServerTrust|TLSPin|publicKeyHashes'
+
+# Method/class dump
+class-dump Payload/App.app/App > classdump.txt
+grep -Ei 'Pinning|TrustEvaluator|ServerTrust|CertificateValidator' classdump.txt
+
+# Embedded certs / pin sets
+find Payload/App.app -name '*.cer' -o -name '*.der' -o -name '*.crt' -o -name '*.pem'
+grep -r 'NSPinnedDomains' Payload/App.app/Info.plist   # iOS 14+ ATS pinning
+```
+
+### 1.3 Common signatures and which bypass to reach for
+
+| Signature                                              | Likely stack                | Bypass tier            |
+|--------------------------------------------------------|-----------------------------|------------------------|
+| `AFSecurityPolicy`, `AFURLSessionManager`              | AFNetworking                | SSL Kill Switch 3      |
+| `Alamofire`, `ServerTrustManager`, `PublicKeysTrustEvaluator` | Alamofire           | Frida hook (1.4 below) |
+| `TSKPinningValidator`, `TrustKitConfig`                | TrustKit                    | TrustKit hook          |
+| `NSPinnedDomains` in Info.plist                        | iOS 14+ ATS native pinning  | SSL Kill Switch 3 / plist patch |
+| `SecTrustEvaluate(WithError)?` direct calls            | Custom CFNetwork            | Frida `SecTrust*` hook |
+| `BoringSSL_Context_set_custom_verify`, `ssl_crypto_x509_session_verify_cert_chain` | Flutter      | libflutter.so hook     |
+| `cronet`, `BoringSSL_SSL_get_peer_cert_chain`          | Chromium/Cronet             | Cronet hook            |
+| `_TtC..._URLSessionPinningDelegate` style names        | Custom Swift                | Hook `URLSession(_:didReceive:completionHandler:)` |
+| References to `ProGuard`, `Xamarin`, `Mono`            | Xamarin                     | Mono hook (different playbook) |
+
+---
+
+## Phase 2 — Bypass methods, in escalation order
+
+### Method A — SSL Kill Switch 3 (try this first, 30 seconds)
+
+For ~70% of apps using stock AFNetworking, ATS `NSPinnedDomains`, or no pinning
+at all (in case ATS is just blocking your CA):
+
+1. Install via Sileo: `https://repo.thecaptain989.com/` or `evilpenguinblog`'s
+   repo.
+2. Settings → SSL Kill Switch 3 → enable for the target bundle ID.
+3. Force-close and relaunch the app.
+4. Replay the flow with proxy attached.
+
+If traffic appears: done. If not, go to Method B. SSL Kill Switch 3 does not
+defeat: TrustKit with custom callback, Flutter, Cronet, manually-implemented
+`SecTrustEvaluate` checks. That's what Frida is for.
+
+### Method B — Objection (Frida wrapper, 2 minutes)
+
+```
+# on host, with frida-server running on device
+objection -g <bundle.id> explore
+ios sslpinning disable
+```
+
+`ios sslpinning disable` patches: `SecTrustEvaluate`, `SecTrustEvaluateWithError`,
+`NSURLSession` delegate `didReceiveChallenge`, AFNetworking's
+`setSSLPinningMode:`, TrustKit's `TSKPinningValidator.evaluateTrust:forHostname:`.
+It's a single command; try it before writing custom Frida.
+
+Verify in proxy. If still pinning (Alamofire's `PublicKeysTrustEvaluator`, Flutter,
+custom BoringSSL), drop to Method C.
+
+### Method C — Targeted Frida hooks
+
+Run from host:
+```
+frida -U -f <bundle.id> -l bypass.js --no-pause
+```
+
+Use the `bypass.js` patterns below. Combine — they don't conflict.
+
+#### C.1 — Generic Apple ObjC + Sec* trust APIs
+
+```javascript
+// bypass.js — generic iOS trust bypass
+if (ObjC.available) {
+  try {
+    // NSURLSession delegate path used by most modern Swift/ObjC code
+    var resolver = new ApiResolver('objc');
+    resolver.enumerateMatches(
+      '-[* URLSession:didReceiveChallenge:completionHandler:]',
+      {
+        onMatch: function (m) {
+          Interceptor.attach(m.address, {
+            onEnter: function (args) {
+              // self=args[0], _cmd=args[1], session=args[2], challenge=args[3], handler=args[4]
+              this.challenge = new ObjC.Object(args[3]);
+              this.handler   = new ObjC.Block(args[4]);
+            },
+            onLeave: function () {
+              try {
+                var protSpace = this.challenge.protectionSpace();
+                var trust = protSpace.serverTrust();
+                if (trust && !trust.isNull()) {
+                  var cred = ObjC.classes.NSURLCredential
+                    .credentialForTrust_(trust);
+                  // NSURLSessionAuthChallengeUseCredential = 0
+                  this.handler.implementation(0, cred);
+                }
+              } catch (e) { /* fall through to original */ }
+            }
+          });
+        },
+        onComplete: function () {}
+      }
+    );
+  } catch (e) { console.log('[!] NSURLSession hook failed: ' + e); }
+}
+
+// Sec* C API path — catches Cronet, custom CFNetwork, some Swift stacks
+var SecTrustEvaluate = Module.findExportByName(null, 'SecTrustEvaluate');
+if (SecTrustEvaluate) {
+  Interceptor.replace(SecTrustEvaluate, new NativeCallback(function (trust, resultPtr) {
+    // kSecTrustResultProceed = 1
+    Memory.writeU32(resultPtr, 1);
+    return 0; // errSecSuccess
+  }, 'int', ['pointer', 'pointer']));
+}
+
+var SecTrustEvaluateWithError = Module.findExportByName(null, 'SecTrustEvaluateWithError');
+if (SecTrustEvaluateWithError) {
+  Interceptor.replace(SecTrustEvaluateWithError, new NativeCallback(function (trust, errorPtr) {
+    if (!errorPtr.isNull()) Memory.writePointer(errorPtr, NULL);
+    return 1; // true => trusted
+  }, 'bool', ['pointer', 'pointer']));
+}
+```
+
+#### C.2 — TrustKit
+
+```javascript
+if (ObjC.available && ObjC.classes.TSKPinningValidator) {
+  var V = ObjC.classes.TSKPinningValidator;
+  V['- evaluateTrust:forHostname:'].implementation = function () {
+    // TSKTrustEvaluationResult: TSKTrustEvaluationSuccess = 0
+    return 0;
+  };
+  // newer TrustKit splits into TSKTrustDecision: TSKTrustDecisionShouldAllow = 0
+  if (V['- handleChallenge:forHostname:completionHandler:']) {
+    V['- handleChallenge:forHostname:completionHandler:'].implementation =
+      function (challenge, hostname, completion) {
+        var cred = ObjC.classes.NSURLCredential
+          .credentialForTrust_(challenge.protectionSpace().serverTrust());
+        new ObjC.Block(completion).implementation(0, cred);
+        return true;
+      };
+  }
+}
+```
+
+#### C.3 — AFNetworking (when SSL Kill Switch isn't installed)
+
+```javascript
+if (ObjC.available && ObjC.classes.AFSecurityPolicy) {
+  var P = ObjC.classes.AFSecurityPolicy;
+  P['- evaluateServerTrust:forDomain:'].implementation = function () { return true; };
+  P['- setSSLPinningMode:'].implementation = function () { /* swallow */ };
+  P['- setAllowInvalidCertificates:'].implementation = function () { /* swallow */ };
+}
+```
+
+#### C.4 — Alamofire (Swift name-mangled — bind on demangled selectors)
+
+Alamofire's `PublicKeysTrustEvaluator.evaluate(_:forHost:)` is hard to address by
+mangled symbol across versions. Hook the C trust APIs (C.1 already does) *and*
+disable Alamofire's `ServerTrustManager` decision:
+
+```javascript
+// Catch Swift-bridged calls that end in SecTrust* — covered by C.1.
+// For Alamofire's PinnedCertificatesTrustEvaluator specifically:
+var alamo = Process.findModuleByName('Alamofire');
+if (alamo) {
+  alamo.enumerateSymbols().forEach(function (s) {
+    if (/TrustEvaluator.*evaluate/.test(s.name)) {
+      try {
+        Interceptor.replace(s.address, new NativeCallback(function () {
+          return 1; // succeed
+        }, 'bool', ['pointer','pointer','pointer']));
+      } catch (e) {}
+    }
+  });
+}
+```
+
+#### C.5 — Flutter (libflutter.dylib / Flutter.framework)
+
+Flutter ships its own BoringSSL and ignores the system trust store entirely. The
+target is `ssl_crypto_x509_session_verify_cert_chain`. Offset shifts per Flutter
+release — locate by pattern, not by symbol (the symbol is stripped in release).
+
+```javascript
+var flutter = Process.findModuleByName('Flutter');
+if (flutter) {
+  // Pattern for arm64 Flutter 3.x — verify against your build with Ghidra first.
+  // Failing that, use Flutter-bypass repo's offset table.
+  // Pseudocode: find function, replace with `return 1`.
+  // For production, use https://github.com/Tonyzzx/flutter-ssl-bypass-frida
+}
+```
+
+Realistically: clone `flutter-ssl-bypass-frida` (or `disable-flutter-tls`),
+paste in the offset for your Flutter version (`strings Flutter | grep
+'Flutter Engine'` to identify), run.
+
+#### C.6 — Cronet / Chromium net stack
+
+Hook `SSL_VERIFY_X509_callback` style entry points or, more practically, the
+Cronet-level `URLRequest` delegate. If you see `cronet_*` symbols, this is a
+Chromium build — the same `SecTrustEvaluate` hooks don't apply because Cronet
+bundles BoringSSL. Use `frida-cronet-bypass` or hook
+`Cronet_UrlRequest_*Verify*`.
+
+#### C.7 — Jailbreak detection (preflight)
+
+If the app dies before you can hook, jailbreak detection is the gate. Hook these
+first, then load pinning bypass:
+
+```javascript
+// File-existence probes
+var open = Module.findExportByName(null, 'open');
+Interceptor.attach(open, {
+  onEnter: function (args) {
+    this.path = Memory.readUtf8String(args[0]);
+  },
+  onLeave: function (retval) {
+    if (this.path && /(Cydia|Sileo|MobileSubstrate|frida|cycript|apt|bash|ssh|jailbreak)/i.test(this.path)) {
+      retval.replace(-1);
+    }
+  }
+});
+
+// fork() — many JB checks try fork and bail if it works (because sandbox blocks fork)
+var fork = Module.findExportByName(null, 'fork');
+if (fork) Interceptor.replace(fork, new NativeCallback(function () { return -1; }, 'int', []));
+
+// URL scheme checks (canOpenURL: with cydia://, sileo://)
+if (ObjC.available) {
+  var UIApp = ObjC.classes.UIApplication;
+  UIApp['- canOpenURL:'].implementation = function (url) {
+    var s = url.absoluteString().toString();
+    if (/(cydia|sileo|undecimus|filza)/i.test(s)) return false;
+    return this.canOpenURL_(url);
+  };
+}
+```
+
+### Method D — Non-jailbroken: patch the IPA
+
+When you only have the IPA and no JB device, options in order of effort:
+
+1. **Objection patchipa** — repacks the IPA with `FridaGadget.dylib` injected
+   and a load command added. Resign with your dev cert and sideload via Xcode /
+   Sideloadly / AltStore. Then run Frida against the gadget.
+   ```
+   objection patchipa --source Target.ipa --codesign-signature <CERT_HASH>
+   ```
+2. **Static patch of pinning calls** — open the binary in Hopper/Ghidra, find
+   `SecTrustEvaluateWithError`, replace prologue with `MOV X0, #1 ; RET`. For
+   AFNetworking, NOP the `evaluateServerTrust:forDomain:` body and force true.
+   Resign (`ldid -S` on tweaked binary, then `zip` back into IPA).
+3. **`optool`/`insert_dylib`** to add a load command for `libsubstitute.dylib`
+   or `FridaGadget.dylib` if patchipa fails.
+
+Resigning is the painful step on Windows — recommend doing it from a macOS VM
+(or a Mac in your CI) using `codesign --force --sign <dev-id> --entitlements
+Entitlements.plist`. Or use TrollStore on a compatible iOS version (15.0–16.6.1,
+17.0) which avoids resigning entirely.
+
+### Method E — Plist / Info.plist tweak for ATS pinning
+
+iOS 14+ `NSPinnedDomains` in `Info.plist`. Patch the IPA:
+
+```xml
+<!-- Remove or empty: -->
+<key>NSAppTransportSecurity</key>
+<dict>
+    <key>NSPinnedDomains</key>
+    <dict>
+        <key>api.target.com</key>
+        <dict>
+            <key>NSPinnedCAIdentities</key>
+            <array>
+                <dict><key>SPKI-SHA256-BASE64</key><string>...</string></dict>
+            </array>
+        </dict>
+    </dict>
+</dict>
+```
+
+Delete the `NSPinnedDomains` subtree, optionally add
+`NSAllowsArbitraryLoads=true`, resign, sideload. This only works when the app
+relies *solely* on ATS pinning — most production apps stack a code-level check
+on top.
+
+---
+
+## Phase 3 — Verification
+
+After running the bypass:
+
+1. **Proxy hit**: relaunch app cold, exercise login / profile / a known API
+   endpoint. Burp should show the request with decrypted body.
+2. **Don't trust the login screen alone** — many apps pin only on the
+   `/auth/token` endpoint and let other endpoints through plainly. Walk a
+   *real* user flow.
+3. **Re-pin probe**: kill the app, disable Frida hook, relaunch. Requests should
+   *fail*. If they still succeed, the app wasn't pinning that endpoint — your
+   bypass was a no-op.
+4. **WebView traffic**: `WKWebView` uses a separate TLS stack (NSURLSession
+   under the hood for navigation, but content TLS is enforced by WebKit).
+   Confirm by visiting an HTTPS page in any in-app WebView and looking for the
+   request in proxy.
+5. **Background tasks / push registration**: some pinning lives only in the
+   APNs registration path or in `BGTaskScheduler` jobs. If your app uses these,
+   trigger them deliberately.
+6. **Document what you bypassed** in the bug-bounty report — note that pinning
+   *was* present and was bypassed (don't claim "no pinning"; pinning being
+   bypassable on a JB device is not itself a finding, but pinning being
+   bypassable on a stock device with a runtime hook absolutely is, in some
+   programs).
+
+---
+
+## Phase 4 — Common failure modes & quick fixes
+
+| Symptom                                          | Likely cause                                                 | Fix |
+|--------------------------------------------------|--------------------------------------------------------------|-----|
+| App crashes on launch with `frida -f`            | Jailbreak / Frida detection                                  | C.7 hooks; or `frida --runtime=v8`; or rename `frida-server` binary |
+| `Failed to attach: unable to connect`            | `frida-server` not running or version mismatch               | `pkill frida-server; frida-server &`; pin host `frida-tools==frida-server` version |
+| Burp shows no traffic, no errors in app          | CA installed but not trusted for TLS                         | Settings → About → Certificate Trust Settings → enable |
+| `NSURLErrorDomain -1200`                         | TLS handshake fail — proxy CA missing OR pinning still on    | Verify CA in Safari first; then re-check bypass |
+| Some requests proxied, others not                | App uses two HTTP stacks (e.g., NSURLSession + Alamofire)    | Layer hooks: C.1 + C.4 + C.5 as needed |
+| Bypass works once, fails on re-launch            | App caches pin result in keychain / does a *background* re-pin | Hook `keychainServices` or rerun bypass with `--no-pause -f` each launch |
+| Flutter app — nothing works                      | BoringSSL inside Flutter ignores system trust                | C.5 path, must hit Flutter's verify function |
+| App is React Native / NativeScript               | JS-layer pinning sometimes via `react-native-ssl-pinning`    | Either Frida-hook the bridge call or patch the JS bundle |
+
+---
+
+## Phase 5 — Output / deliverables for the engagement
+
+For each app you bypass, record in a notebook (kept in your VFS-style scope dir
+if applicable):
+
+- App bundle ID + version
+- Pinning library detected (from Phase 1 fingerprint)
+- Method used (A/B/C-x/D/E) + exact Frida script
+- Endpoints that were pinned vs not
+- Any pin set / SPKI hashes recovered (often valuable on its own)
+- Whether bypass survives across app updates (binary patch fingerprint shifts;
+  Frida hook usually survives)
+
+---
+
+## Critical files / artifacts to produce
+
+This plan does not modify any file in this repo. Execution would create:
+
+- `~/ios-pentest/bypass.js` — the layered Frida script (templates above).
+- `~/ios-pentest/<app>-notes.md` — per-app fingerprint + method + endpoints.
+- `~/ios-pentest/<app>-decrypted.ipa` — for non-JB patching path (Method D).
+
+If you want this checked into a project dir (e.g., the VFS workspace or a new
+`Videos\Bugbounty\<App>\ios\` tree), say so and I'll lay it out.
+
+---
+
+## References (canonical, no guesswork)
+
+- OWASP MASTG — Mobile App Security Testing Guide, iOS Network Communication
+- Frida iOS handbook — https://frida.re/docs/ios/
+- Objection — https://github.com/sensepost/objection
+- SSL Kill Switch 3 — https://github.com/julioverne/SSLKillSwitch
+- TrustKit — https://github.com/datatheorem/TrustKit (for understanding the API surface you're hooking)
+- AloneMonkey/frida-ios-dump — IPA decryption from JB device
+- HackTricks iOS pentesting checklist (sanity reference)
+
+---
+
+## Verification of this plan itself
+
+You can dry-run the plan against your existing setup:
+
+1. Open this file, walk Phases 0 → 1 mentally, list anything missing on your
+   host (Windows) — e.g., do you have `iproxy` / libimobiledevice installed?
+2. Pick a target app in scope (VFS mobile app would qualify if their iOS app is
+   in scope — confirm against `scope/in-scope-*.txt` first).
+3. Run Phase 1 fingerprint only — no bypass yet. The output tells me which
+   method to write a real script for.
+
+When you're ready to execute, exit plan mode and I'll generate the exact
+`bypass.js` for the target's specific pin stack.
